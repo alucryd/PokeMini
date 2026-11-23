@@ -16,6 +16,10 @@
 #include <libretro_core_options.h>
 #include <retro_miscellaneous.h>
 #include <streams/file_stream.h>
+#ifdef HAVE_ORE
+#include <strings.h>
+#include <smelt.h>
+#endif
 
 // PokeMini headers
 #include "MinxIO.h"
@@ -971,7 +975,11 @@ void retro_get_system_info(struct retro_system_info *info)
 {
 	memset(info, 0, sizeof(*info));
 	info->need_fullpath    = false;
+	#ifdef HAVE_ORE
+	info->valid_extensions = "min|ore";
+#else
 	info->valid_extensions = "min";
+#endif
 	info->library_version  = "v0.60";
 	info->library_name     = "PokeMini";
 	info->block_extract    = false;
@@ -1248,12 +1256,91 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
 
 ///////////////////////////////////////////////////////////
 
+#ifdef HAVE_ORE
+/* Read an ORE, oxyromon's ROM format, through libsmelt as the ROM it holds:
+   a malloc'd buffer the caller frees, or NULL with the reason logged. */
+static uint8_t *load_ore_rom(const char *path, size_t *size)
+{
+	struct smelt_ingot *ingot = NULL;
+	uint64_t logical = 0;
+	uint8_t *rom = NULL;
+	char platform[32];
+	size_t platform_len = sizeof(platform);
+
+	if (smelt_open(path, NULL, &ingot) != SMELT_OK ||
+	    smelt_logical_size(ingot, &logical) != SMELT_OK ||
+	    smelt_platform(ingot, platform, &platform_len) != SMELT_OK)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_ERROR, "ORE %s: %s\n", path, smelt_last_error());
+		smelt_close(ingot);
+		return NULL;
+	}
+
+	if (strcmp(platform, "pokemini") != 0)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_ERROR, "ORE %s is a %s ROM, which PokeMini does not run\n", path, platform);
+		smelt_close(ingot);
+		return NULL;
+	}
+
+	/* PokeMini_LoadMINFileXPLATFORM takes at most 2 MiB */
+	if (logical == 0 || logical > 0x200000)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_ERROR, "ORE %s holds %llu bytes, too many for a Pokemon Mini ROM\n",
+			       path, (unsigned long long)logical);
+		smelt_close(ingot);
+		return NULL;
+	}
+
+	rom = (uint8_t *)malloc((size_t)logical);
+	if (!rom || smelt_read(ingot, 0, rom, (size_t)logical) != SMELT_OK)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_ERROR, "ORE %s: %s\n", path, rom ? smelt_last_error() : "out of memory");
+		free(rom);
+		rom = NULL;
+	}
+	smelt_close(ingot);
+	*size = (size_t)logical;
+	return rom;
+}
+
+static bool is_ore(const char *path)
+{
+	size_t len = path ? strlen(path) : 0;
+	return len >= 4 && strcasecmp(path + len - 4, ".ore") == 0;
+}
+#endif
+
 bool retro_load_game(const struct retro_game_info *game)
 {
 	int passed;
+	const uint8_t *rom_data;
+	size_t rom_size;
+#ifdef HAVE_ORE
+	uint8_t *ore_rom = NULL;
+#endif
 	
 	if (!game)
 		return false;
+
+	rom_data = (const uint8_t*)game->data;
+	rom_size = game->size;
+#ifdef HAVE_ORE
+	/* need_fullpath is off, so game->data holds the .ore's own bytes; the
+	   frontend still passes the path, which is what libsmelt reads. Read it
+	   first, so a bad ORE fails the load rather than the abort() below. */
+	if (is_ore(game->path))
+	{
+		ore_rom = load_ore_rom(game->path, &rom_size);
+		if (!ore_rom)
+			return false;
+		rom_data = ore_rom;
+	}
+#endif
 	
 	InitialiseInputDescriptors();
 	InitialiseRumbleInterface();
@@ -1276,7 +1363,12 @@ bool retro_load_game(const struct retro_game_info *game)
 	
 	MinxAudio_ChangeEngine(CommandLine.sound); // enable sound
 	
-	if (!(passed = PokeMini_LoadMINFileXPLATFORM(game->size, (uint8_t*)game->data))) // returns 1 on completion,0 on error
+	passed = PokeMini_LoadMINFileXPLATFORM(rom_size, (uint8_t*)rom_data); // returns 1 on completion,0 on error
+#ifdef HAVE_ORE
+	/* PokeMini_LoadMINFileXPLATFORM keeps a copy of its own */
+	free(ore_rom);
+#endif
+	if (!passed)
 		abort();
 	
 	// Load EEPROM
